@@ -32,8 +32,8 @@ const uploadAndExtract = async (req, res) => {
   } catch (err) {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     console.error('Extraction error:', err);
-    res.status(500).json({
-      message: 'Failed to process certificate.',
+    res.status(err.userFacing ? 422 : 500).json({
+      message: err.userFacing ? err.message : 'Failed to process certificate.',
       error: err.message,
     });
   }

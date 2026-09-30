@@ -1,4 +1,6 @@
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
+const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const createTables = require('./db/migrate');
@@ -9,7 +11,7 @@ const verifyRoutes = require('./routes/verify');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors({ origin: 'http://localhost:3000' }));
+app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -21,6 +23,16 @@ app.use('/api/verify', verifyRoutes);
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
+
+// Serve the React build (production). Non-API routes fall through to index.html
+// so client-side routes like /admin work on refresh.
+const FRONTEND_BUILD = path.join(__dirname, '../../frontend/build');
+if (fs.existsSync(FRONTEND_BUILD)) {
+  app.use(express.static(FRONTEND_BUILD));
+  app.get(/^\/(?!api\/).*/, (_req, res) => {
+    res.sendFile(path.join(FRONTEND_BUILD, 'index.html'));
+  });
+}
 
 // 404
 app.use((_req, res) => {
@@ -37,7 +49,7 @@ const start = async () => {
   try {
     await createTables();
     app.listen(PORT, () => {
-      console.log(`Server running on http://localhost:${PORT}`);
+      console.log(`Server running on port ${PORT}`);
     });
   } catch (err) {
     console.error('Failed to start server:', err);

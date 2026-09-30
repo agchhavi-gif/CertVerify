@@ -3,227 +3,393 @@ const pdfParse = require('pdf-parse');
 const fs = require('fs');
 const path = require('path');
 
+const IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'];
+
 const extractFromPDF = async (filePath) => {
-  const dataBuffer = fs.readFileSync(filePath);
-  const data = await pdfParse(dataBuffer);
+  const data = await pdfParse(fs.readFileSync(filePath));
   return data.text;
 };
 
+/**
+ * OCR the image twice: automatic layout (keeps line order) and sparse text
+ * (catches words scattered across decorative certificate designs).
+ * Returns one text per pass.
+ */
 const extractFromImage = async (filePath) => {
-  const result = await Tesseract.recognize(filePath, 'eng', { logger: () => {} });
-  return result.data.text;
+  // cachePath: use the bundled backend/eng.traineddata regardless of the working directory
+  const worker = await Tesseract.createWorker('eng', 1, {
+    logger: () => {},
+    cachePath: path.join(__dirname, '../..'),
+  });
+  try {
+    await worker.setParameters({ preserve_interword_spaces: '1' });
+    const texts = [];
+    for (const psm of [Tesseract.PSM.AUTO, Tesseract.PSM.SPARSE_TEXT]) {
+      await worker.setParameters({ tessedit_pageseg_mode: psm });
+      const { data } = await worker.recognize(filePath);
+      texts.push(data.text);
+    }
+    return texts;
+  } finally {
+    await worker.terminate();
+  }
 };
 
 /**
- * Manually parse "27 Aug 2026" style dates that Node's Date constructor
- * cannot handle (day-first format).
- * Returns "YYYY-MM-DD" string or null.
+ * Normalize unicode punctuation and whitespace, split into clean lines.
  */
-const parseDate = (str) => {
-  if (!str) return null;
-
-  const MONTH_MAP = {
-    jan: 0, january: 0,
-    feb: 1, february: 1,
-    mar: 2, march: 2,
-    apr: 3, april: 3,
-    may: 4,
-    jun: 5, june: 5,
-    jul: 6, july: 6,
-    aug: 7, august: 7,
-    sep: 8, september: 8,
-    oct: 9, october: 9,
-    nov: 10, november: 10,
-    dec: 11, december: 11,
-  };
-
-  // "27 Aug 2026" — day month year
-  const dayMonthYear = str.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/);
-  if (dayMonthYear) {
-    const day = parseInt(dayMonthYear[1], 10);
-    const month = MONTH_MAP[dayMonthYear[2].toLowerCase()];
-    const year = parseInt(dayMonthYear[3], 10);
-    if (month !== undefined) {
-      const d = new Date(year, month, day);
-      if (!isNaN(d.getTime())) {
-        return d.toISOString().split('T')[0];
-      }
-    }
-  }
-
-  // "Aug 27, 2026" or "Aug 27 2026" — month day year
-  const monthDayYear = str.match(/^([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})$/);
-  if (monthDayYear) {
-    const month = MONTH_MAP[monthDayYear[1].toLowerCase()];
-    const day = parseInt(monthDayYear[2], 10);
-    const year = parseInt(monthDayYear[3], 10);
-    if (month !== undefined) {
-      const d = new Date(year, month, day);
-      if (!isNaN(d.getTime())) {
-        return d.toISOString().split('T')[0];
-      }
-    }
-  }
-
-  // "2026-08-27" — ISO format
-  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (iso) {
-    const d = new Date(parseInt(iso[1]), parseInt(iso[2]) - 1, parseInt(iso[3]));
-    if (!isNaN(d.getTime())) return d.toISOString().split('T')[0];
-  }
-
-  // "27/08/2026" or "08/27/2026"
-  const slashed = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (slashed) {
-    // Try DD/MM/YYYY first (common in India)
-    const d = new Date(parseInt(slashed[3]), parseInt(slashed[2]) - 1, parseInt(slashed[1]));
-    if (!isNaN(d.getTime())) return d.toISOString().split('T')[0];
-  }
-
-  return null;
-};
-
-const parseFields = (rawText) => {
-  const result = {
-    recipientName: null,
-    issueDate: null,
-    certificateId: null,
-  };
-
-  const lines = rawText
-    .split('\n')
-    .map((l) => l.trim())
+const toLines = (rawText) =>
+  rawText
+    .replace(/[‐-―−]/g, '-')
+    .replace(/[‘’‛′]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[  -​ ﻿]/g, ' ')
+    .split(/\r?\n/)
+    .map((l) => l.replace(/[ \t]+/g, ' ').trim())
     .filter((l) => l.length > 0);
 
-  const MONTHS_RE = /jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?/i;
+// ─────────────────────────── Dates ───────────────────────────
 
-  // ── Find the line that has both a date AND the cert ID ──
-  // Format: "27 Aug 2026 6452219000000395001"
-  // We need to split this line carefully:
-  //   - Date part: tokens that form a valid date
-  //   - ID part: the remaining long numeric token
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const MONTH_RE = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?';
+const monthNum = (name) => MONTHS[name.slice(0, 3).toLowerCase()];
 
-  let dateLine = null;
-  let dateLineIndex = -1;
+/**
+ * Build a "YYYY-MM-DD" string without going through Date/toISOString,
+ * which shifts the day in timezones ahead of UTC (e.g. IST).
+ * Returns null for impossible dates.
+ */
+const toISO = (y, m, d) => {
+  const year = +y;
+  const month = +m;
+  const day = +d;
+  const maxYear = new Date().getFullYear() + 10;
+  if (year < 1950 || year > maxYear || month < 1 || month > 12 || day < 1) return null;
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (day > daysInMonth) return null;
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+};
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // Does this line contain a month name AND a long number?
-    if (MONTHS_RE.test(line) && /\d{10,}/.test(line)) {
-      dateLine = line;
-      dateLineIndex = i;
-      break;
-    }
-    // Or does it have a 4-digit year and a long number?
-    if (/\b\d{4}\b/.test(line) && /\d{10,}/.test(line)) {
-      dateLine = line;
-      dateLineIndex = i;
-      break;
+// Ordered by specificity; later patterns are ignored where an earlier one already matched.
+const DATE_PATTERNS = [
+  // 27 Aug 2026, 27th August, 2026, 27-Aug-2026, 27 of August 2026
+  {
+    re: new RegExp(`(?<!\\d)(\\d{1,2})(?:st|nd|rd|th)?[\\s\\-\\/.,]*(?:of\\s+)?${MONTH_RE}[\\s\\-\\/.,]*(\\d{4})(?!\\d)`, 'gi'),
+    base: 3,
+    parse: (m) => toISO(m[3], monthNum(m[2]), m[1]),
+  },
+  // August 27, 2026 / Aug 27th 2026
+  {
+    re: new RegExp(`(?<![a-z])${MONTH_RE}[\\s\\-\\/.]*(\\d{1,2})(?:st|nd|rd|th)?[\\s,\\-]+(\\d{4})(?!\\d)`, 'gi'),
+    base: 3,
+    parse: (m) => toISO(m[3], monthNum(m[1]), m[2]),
+  },
+  // 2026-08-27 / 2026/08/27 / 2026.08.27
+  {
+    re: /(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)/g,
+    base: 3,
+    parse: (m) => toISO(m[1], m[2], m[3]),
+  },
+  // 27/08/2026, 27-08-2026, 27.08.2026: day-first (India/UK) unless that is impossible
+  {
+    re: /(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})(?!\d)/g,
+    base: 2,
+    parse: (m) => (+m[2] > 12 && +m[1] <= 12 ? toISO(m[3], m[1], m[2]) : toISO(m[3], m[2], m[1])),
+  },
+  // August 2026 (no day: assume the 1st, lowest confidence)
+  {
+    re: new RegExp(`(?<![a-z])${MONTH_RE}[\\s,]+(\\d{4})(?!\\d)`, 'gi'),
+    base: 1,
+    parse: (m) => toISO(m[2], monthNum(m[1]), 1),
+  },
+];
+
+/**
+ * All valid dates on a line, as { iso, start, end, base }, without overlaps.
+ */
+const findDatesInLine = (line) => {
+  const found = [];
+  for (const { re, base, parse } of DATE_PATTERNS) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      const start = m.index;
+      const end = start + m[0].length;
+      if (found.some((f) => start < f.end && end > f.start)) continue;
+      const iso = parse(m);
+      if (iso) found.push({ iso, start, end, base });
     }
   }
+  return found.sort((a, b) => a.start - b.start);
+};
 
-  if (dateLine) {
-    // Extract the long numeric ID — must be standalone (preceded by space or start)
-    // The cert ID is the last token on this line
-    const tokens = dateLine.split(/\s+/);
+const ISSUE_CTX_RE = /\b(?:issued?|issue\s*date|date\s*of\s*(?:issue|award|completion)|dated|awarded|granted|conferred|completed|completion|achieved|earned|given)\b/i;
+const DATE_LABEL_RE = /\bdate\b/i;
+const NOT_ISSUE_CTX_RE = /\b(?:expir\w*|valid\s*(?:until|till|thru|through|to|upto|up\s*to)|renew\w*|birth|dob|d\.o\.b)\b/i;
 
-    // Find cert ID: last token that is purely digits and 10+ chars
-    for (let i = tokens.length - 1; i >= 0; i--) {
-      if (/^\d{10,}$/.test(tokens[i])) {
-        result.certificateId = tokens[i];
-        // Remove the cert ID token from what we use for date parsing
-        tokens.splice(i, 1);
-        break;
+const pickIssueDate = (lines, datesByLine) => {
+  let best = null;
+
+  lines.forEach((line, li) => {
+    const dates = datesByLine[li];
+    // A label on the previous line only counts if that line has no date of its own
+    const prev = li > 0 && datesByLine[li - 1].length === 0 ? lines[li - 1] : '';
+
+    dates.forEach((d, di) => {
+      const before = line.slice(di > 0 ? dates[di - 1].end : 0, d.start);
+      let score = d.base;
+
+      if (NOT_ISSUE_CTX_RE.test(before)) score -= 10;
+      else if (NOT_ISSUE_CTX_RE.test(prev)) score -= 6;
+      // Second date of a validity range: "Valid from X to Y"
+      if (di > 0 && /^\s*(?:to|until|till|thru|through|-)\s*$/i.test(before) && /valid|expir/i.test(line)) score -= 10;
+
+      if (ISSUE_CTX_RE.test(before)) score += 6;
+      else if (ISSUE_CTX_RE.test(prev)) score += 4;
+      if (DATE_LABEL_RE.test(before)) score += 3;
+      else if (DATE_LABEL_RE.test(prev)) score += 2;
+
+      if (!best || score > best.score) best = { value: d.iso, score };
+    });
+  });
+
+  return best;
+};
+
+// ─────────────────────── Certificate ID ───────────────────────
+
+const ID_WORDS = '(?:certificate|certification|cert|credential|licen[cs]e|registration|reg|serial|reference|ref|verification|enrol{1,2}ment|roll|award|document|unique|membership|student)';
+const ID_SUFFIX = '(?:id|[l1|]d|no|number|num|code)';
+const ID_LABEL_RE = new RegExp(
+  `\\b(?:${ID_WORDS}\\.?\\s*${ID_SUFFIX}\\b\\.?|${ID_WORDS}\\s*#|credential\\b|serial\\b|id\\b|s\\.?\\s*no\\b\\.?)\\s*[:#\\-]?\\s*`,
+  'gi'
+);
+const URL_RE = /(?:https?:\/\/|www\.)\S+|\b[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}\/\S+/gi;
+const PHONE_CTX_RE = /\b(?:phone|mobile|mob|tel|telephone|contact|fax|pin\s*code|zip)\b|\+\d/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const cleanToken = (t) => t.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+
+const isIdLike = (token) =>
+  token.length >= 4 &&
+  token.length <= 64 &&
+  /\d/.test(token) &&
+  /^[A-Za-z0-9][A-Za-z0-9\-/_.]*$/.test(token) &&
+  !/^\d{4}$/.test(token) &&
+  findDatesInLine(token).length === 0;
+
+const idFromUrl = (url) => {
+  const cleaned = url.replace(/[).,;'"]+$/, '');
+  const query = cleaned.match(/[?&](?:id|cert\w*|credential\w*|code|verify\w*)=([^&#\s]+)/i);
+  if (query && isIdLike(cleanToken(query[1]))) return cleanToken(query[1]);
+  const segments = cleaned.split(/[?#]/)[0].split('/').filter(Boolean);
+  const last = cleanToken(segments[segments.length - 1] || '');
+  return segments.length > 1 && isIdLike(last) ? last : null;
+};
+
+const pickCertificateId = (lines, datesByLine) => {
+  const candidates = [];
+  const add = (value, score) => candidates.push({ value: value.toUpperCase(), score });
+
+  lines.forEach((line, li) => {
+    // 1. Labelled: "Certificate ID: ABC-123", "Credential No. 12345", value possibly on the next line
+    ID_LABEL_RE.lastIndex = 0;
+    let m;
+    while ((m = ID_LABEL_RE.exec(line)) !== null) {
+      if (m[0].length === 0) { ID_LABEL_RE.lastIndex++; continue; }
+      const rest = line.slice(m.index + m[0].length).trim();
+      const token = cleanToken(rest.split(/\s+/)[0] || '');
+      if (isIdLike(token)) add(token, 10);
+      else if (!rest && lines[li + 1]) {
+        const next = cleanToken(lines[li + 1].split(/\s+/)[0]);
+        if (isIdLike(next)) add(next, 9);
       }
     }
 
-    // Remaining tokens form the date string e.g. "27 Aug 2026"
-    const dateStr = tokens.join(' ').trim();
-    result.issueDate = parseDate(dateStr);
-  }
+    // 2. Verification URLs: ".../verify/UC-1234", "...?credentialId=ABC123"
+    const urls = line.match(URL_RE) || [];
+    for (const url of urls) {
+      const id = idFromUrl(url);
+      if (id) add(id, 7);
+    }
 
-  // ── Fallback cert ID search (alphanumeric like UC-123456789) ──
-  if (!result.certificateId) {
-    for (const line of lines) {
-      const tokens = line.split(/\s+/);
-      for (const token of tokens) {
-        if (/^[A-Z]{2,}-[A-Z0-9\-]{4,}$/i.test(token)) {
-          result.certificateId = token.trim().toUpperCase();
+    // 3. Unlabelled tokens that look like IDs
+    const lineWithoutUrls = urls.reduce((l, u) => l.replace(u, ' '), line);
+    for (const raw of lineWithoutUrls.split(/\s+/)) {
+      if (raw.includes('@')) continue;
+      const token = cleanToken(raw);
+      if (token.length < 6 || !isIdLike(token)) continue;
+
+      let score;
+      if (UUID_RE.test(token)) score = 6;
+      else if (/^\d+$/.test(token)) score = token.length >= 10 ? 5 : 2;
+      else if (/[A-Za-z]/.test(token) && (token.match(/\d/g) || []).length >= 2) score = /[-_/]/.test(token) ? 5 : 3;
+      else continue;
+
+      if (PHONE_CTX_RE.test(line)) score -= 6;
+      if (datesByLine[li].length > 0) score += 1;
+      add(token, score);
+    }
+  });
+
+  return candidates.reduce((best, c) => (!best || c.score > best.score ? c : best), null);
+};
+
+// ─────────────────────── Recipient Name ───────────────────────
+
+const NAME_INTRO_RE = /(?:\bthis\s+is\s+to\s+certify\s+that|\bthis\s+certifies\s+that|\bhereby\s+certif(?:y|ies)\s+that|\bcertif(?:y|ies)\s+that|\b(?:is\s+)?(?:proudly\s+|hereby\s+)?(?:presented|awarded|granted|issued|given)\s+to|\bconferred\s+(?:up)?on|\bbestowed\s+(?:up)?on|\bcongratulations|\b(?:recipient|participant|student|candidate|awardee|holder|learner)(?:'?s)?\s+name|\bname\s+of\s+(?:the\s+)?(?:recipient|participant|student|candidate)|^name)\s*[:\-,]?\s*/i;
+
+const COMPLETION_RE = /\b(?:has|have)\s+(?:successfully\s+)?(?:completed|participated|attended|achieved|passed|earned|demonstrated|fulfilled|cleared|been)\b|\bsuccessfully\b|\bfor\s+(?:successfully|completing|the\s+completion|participat\w*|outstanding|excellence|his|her|their|active|attending)\b|\bcompleting\b|\bparticipat(?:ed|ion)\s+in\b/i;
+
+const SIGNATORY_RE = /\b(?:founder|co-?founder|ceo|cto|coo|director|president|principal|dean|registrar|chairman|chairperson|coordinator|instructor|trainer|mentor|manager|head|chief|officer|secretary|signature|signatory|authori[sz]ed|vp)\b/i;
+
+const HONORIFIC_RE = /^(?:mr|mrs|ms|miss|mx|dr|prof|shri|smt|sri|kumari|km)\.?\s+/i;
+
+// Words that never appear in a person's name on a certificate
+const STOPWORDS = new Set(`
+  certificate certificates certification certifications certified certify certifies completion complete completed
+  achievement achievements participation appreciation excellence merit honor honour award awarded awards presented
+  present recognition course courses program programme training workshop internship bootcamp webinar seminar
+  conference hackathon competition contest university institute institution college school academy education
+  foundation company corporation corp pvt private ltd limited inc llc llp technologies technology solutions services
+  systems group department board council society association club team director founder ceo manager president
+  principal dean head chief officer coordinator instructor trainer mentor signature signed authorized authorised
+  signatory date issued issue valid validity expiry expires id number serial credential verify verification online
+  digital professional associate specialist specialization developer advanced beginner intermediate fundamentals
+  introduction basics requirements organizational successfully hereby this that the is to of and for with has have
+  in on at by from an congratulations name recipient participant student candidate grade score marks hours level
+  module project powered official
+`.trim().split(/\s+/));
+
+const NAME_SHAPE_RE = /^\p{L}[\p{L}.'-]*(?:\s+\p{L}[\p{L}.'-]*){0,4}$/u;
+
+/**
+ * Strip trailing sentence text, honorifics and noise from a name candidate.
+ * Returns { name, hadCompletionTail }.
+ */
+const cleanName = (text) => {
+  const tail = text.match(/\s+(?:has|have|had|for|who|from|on|in|with|is|was|successfully|s\/o|d\/o|w\/o|son|daughter|bearing|having)\b.*$/i);
+  let name = tail ? text.slice(0, tail.index) : text;
+  name = name
+    .replace(/^[^\p{L}]+|[^\p{L}.]+$/gu, '')
+    .replace(HONORIFIC_RE, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[.,]+$/, '')
+    .trim();
+  return { name, hadCompletionTail: !!tail && COMPLETION_RE.test(tail[0]) };
+};
+
+const looksLikeName = (name) => {
+  if (name.length < 3 || name.length > 60 || !NAME_SHAPE_RE.test(name)) return false;
+  const words = name.split(' ');
+  if (!words.some((w) => w.replace(/\./g, '').length >= 2)) return false;
+  return !words.some((w) => STOPWORDS.has(w.toLowerCase().replace(/[.'-]/g, '')));
+};
+
+const isTitleCase = (name) => name.split(' ').every((w) => /^\p{Lu}/u.test(w));
+const isAllCaps = (name) => name === name.toUpperCase() && name !== name.toLowerCase();
+
+const pickRecipientName = (lines, datesByLine) => {
+  let best = null;
+  const consider = (name, score) => {
+    if (!best || score > best.score) best = { value: name, score };
+  };
+
+  lines.forEach((line, li) => {
+    // 1. Introduced: "This is to certify that John Smith", "Presented to" followed by the name on the next line
+    const intro = line.match(NAME_INTRO_RE);
+    if (intro) {
+      const sameLine = cleanName(line.slice(intro.index + intro[0].length)).name;
+      const following = [lines[li + 1], lines[li + 2]].map((l) => (l ? cleanName(l).name : ''));
+      const options = [[sameLine, 12], [following[0], 11], [following[1], 9]];
+      for (const [name, score] of options) {
+        if (name && looksLikeName(name)) {
+          consider(name, name.includes(' ') ? score : score - 3);
           break;
         }
       }
-      if (result.certificateId) break;
     }
-  }
 
-  // ── Fallback date search ──
-  if (!result.issueDate) {
-    const datePatterns = [
-      new RegExp(`(\\d{1,2}\\s+(?:${MONTHS_RE.source})\\s+\\d{4})`, 'i'),
-      new RegExp(`((?:${MONTHS_RE.source})\\s+\\d{1,2},?\\s+\\d{4})`, 'i'),
-      /(\d{4}-\d{2}-\d{2})/,
-      /(\d{1,2}\/\d{1,2}\/\d{4})/,
-    ];
-    for (const pat of datePatterns) {
-      const m = rawText.match(pat);
-      if (m) {
-        const parsed = parseDate(m[1].trim());
-        if (parsed) { result.issueDate = parsed; break; }
-      }
-    }
-  }
+    // 2. Any line that is shaped like a name, scored by its surroundings
+    const { name, hadCompletionTail } = cleanName(line);
+    if (!looksLikeName(name)) return;
 
-  // ── Recipient Name ──
-  const SKIP = /concretio|salesforce|certified|developer|advanced|presented|completing|organizational|certification|requirements|founder|issue\s*date|abhinav/i;
+    let score = name.includes(' ') ? 3 : -2;
+    if (isTitleCase(name)) score += 2;
+    else if (isAllCaps(name)) score += 1;
+    if (hadCompletionTail) score += 5;
+    if (lines[li + 1] && COMPLETION_RE.test(lines[li + 1])) score += 6;
+    if (datesByLine[li + 1] && datesByLine[li + 1].length > 0) score += 2;
+    if ((lines[li - 1] && SIGNATORY_RE.test(lines[li - 1])) || (lines[li + 1] && SIGNATORY_RE.test(lines[li + 1]))) score -= 8;
 
-  // Line before the date+ID line
-  if (dateLineIndex > 0) {
-    for (let j = dateLineIndex - 1; j >= 0; j--) {
-      const candidate = lines[j];
-      if (
-        /^[A-Za-z][A-Za-z\s'\-]{2,59}$/.test(candidate) &&
-        !SKIP.test(candidate) &&
-        candidate.trim().split(/\s+/).length >= 2
-      ) {
-        result.recipientName = candidate.trim();
-        break;
-      }
-    }
-  }
+    if (score >= 3) consider(name, score);
+  });
 
-  // Fallback: first properly-capitalized name line
-  if (!result.recipientName) {
-    for (const line of lines) {
-      if (
-        /^[A-Z][a-z]+(\s[A-Z][a-z]+)+$/.test(line) &&
-        !SKIP.test(line)
-      ) {
-        result.recipientName = line.trim();
-        break;
-      }
-    }
-  }
+  return best;
+};
 
-  return result;
+const formatName = (name) =>
+  isAllCaps(name) || name === name.toLowerCase()
+    ? name.toLowerCase().replace(/(^|[\s'-])(\p{L})/gu, (m, sep, ch) => sep + ch.toUpperCase())
+    : name;
+
+// ─────────────────────────── Parsing ───────────────────────────
+
+/**
+ * Parse one text into scored fields: { field: { value, score } | null }.
+ */
+const parseScored = (rawText) => {
+  const lines = toLines(rawText);
+  const datesByLine = lines.map(findDatesInLine);
+  return {
+    recipientName: pickRecipientName(lines, datesByLine),
+    issueDate: pickIssueDate(lines, datesByLine),
+    certificateId: pickCertificateId(lines, datesByLine),
+  };
+};
+
+/**
+ * Parse one or more texts (e.g. several OCR passes) and keep the
+ * highest-scoring value for each field.
+ */
+const parseFields = (texts) => {
+  const passes = (Array.isArray(texts) ? texts : [texts]).map(parseScored);
+  const bestOf = (field) =>
+    passes.map((p) => p[field]).filter(Boolean).reduce((a, b) => (b.score > a.score ? b : a), { value: null, score: -Infinity }).value;
+
+  const name = bestOf('recipientName');
+  return {
+    recipientName: name ? formatName(name) : null,
+    issueDate: bestOf('issueDate'),
+    certificateId: bestOf('certificateId'),
+  };
 };
 
 const extractCertData = async (filePath) => {
   const ext = path.extname(filePath).toLowerCase();
-  let rawText = '';
+  let texts;
 
   if (ext === '.pdf') {
-    rawText = await extractFromPDF(filePath);
-  } else if (['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'].includes(ext)) {
-    rawText = await extractFromImage(filePath);
+    const text = await extractFromPDF(filePath);
+    if (text.replace(/\s/g, '').length < 20) {
+      const err = new Error('This PDF has no selectable text (it is probably a scanned image). Upload it as a JPG or PNG instead.');
+      err.userFacing = true;
+      throw err;
+    }
+    texts = [text];
+  } else if (IMAGE_EXTS.includes(ext)) {
+    texts = await extractFromImage(filePath);
   } else {
     throw new Error(`Unsupported file type: ${ext}`);
   }
+
+  const rawText = texts.join('\n\n');
 
   console.log('\n========== RAW EXTRACTED TEXT ==========');
   console.log(JSON.stringify(rawText));
   console.log('=========================================\n');
 
-  const parsed = parseFields(rawText);
+  const parsed = parseFields(texts);
 
   console.log('========== PARSED FIELDS ==========');
   console.log(parsed);
@@ -233,3 +399,4 @@ const extractCertData = async (filePath) => {
 };
 
 module.exports = extractCertData;
+module.exports.parseFields = parseFields;
