@@ -71,16 +71,19 @@ const toISO = (y, m, d) => {
 };
 
 // Ordered by specificity; later patterns are ignored where an earlier one already matched.
+// Patterns 1 and 2 have no trailing (?!\d): a month name right before the year is strong
+// enough signal that the next 4 digits are the year even if OCR glued an ID straight
+// after it with no space (e.g. "12 Oct 20266452219000000388316").
 const DATE_PATTERNS = [
   // 27 Aug 2026, 27th August, 2026, 27-Aug-2026, 27 of August 2026
   {
-    re: new RegExp(`(?<!\\d)(\\d{1,2})(?:st|nd|rd|th)?[\\s\\-\\/.,]*(?:of\\s+)?${MONTH_RE}[\\s\\-\\/.,]*(\\d{4})(?!\\d)`, 'gi'),
+    re: new RegExp(`(?<!\\d)(\\d{1,2})(?:st|nd|rd|th)?[\\s\\-\\/.,]*(?:of\\s+)?${MONTH_RE}[\\s\\-\\/.,]*(\\d{4})`, 'gi'),
     base: 3,
     parse: (m) => toISO(m[3], monthNum(m[2]), m[1]),
   },
   // August 27, 2026 / Aug 27th 2026
   {
-    re: new RegExp(`(?<![a-z])${MONTH_RE}[\\s\\-\\/.]*(\\d{1,2})(?:st|nd|rd|th)?[\\s,\\-]+(\\d{4})(?!\\d)`, 'gi'),
+    re: new RegExp(`(?<![a-z])${MONTH_RE}[\\s\\-\\/.]*(\\d{1,2})(?:st|nd|rd|th)?[\\s,\\-]+(\\d{4})`, 'gi'),
     base: 3,
     parse: (m) => toISO(m[3], monthNum(m[1]), m[2]),
   },
@@ -170,6 +173,14 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const cleanToken = (t) => t.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
 
+/**
+ * Blank out index ranges in a string (replace with spaces, keeping positions stable).
+ * Used to strip matched dates out of a line before looking for IDs, so a date glued
+ * straight onto an ID with no space (common OCR artifact) doesn't merge into one token.
+ */
+const blankRanges = (line, ranges) =>
+  ranges.reduce((out, r) => out.slice(0, r.start) + ' '.repeat(r.end - r.start) + out.slice(r.end), line);
+
 const isIdLike = (token) =>
   token.length >= 4 &&
   token.length <= 64 &&
@@ -214,7 +225,8 @@ const pickCertificateId = (lines, datesByLine) => {
     }
 
     // 3. Unlabelled tokens that look like IDs
-    const lineWithoutUrls = urls.reduce((l, u) => l.replace(u, ' '), line);
+    const lineNoDates = blankRanges(line, datesByLine[li]);
+    const lineWithoutUrls = urls.reduce((l, u) => l.replace(u, ' '), lineNoDates);
     for (const raw of lineWithoutUrls.split(/\s+/)) {
       if (raw.includes('@')) continue;
       const token = cleanToken(raw);
